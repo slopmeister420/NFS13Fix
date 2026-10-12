@@ -2,6 +2,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <string>
+#include <vector>
 
 namespace config {
 namespace {
@@ -20,15 +22,58 @@ const char kDefaults[] =
     "; any controller SDL supports plays as an xbox pad\r\n"
     "SDLInput=1\r\n"
     "\r\n"
-    "; 1 = files under the mods folder override the game's own files\r\n"
+    "; files under the mods folder override the game's own files\r\n"
     "ModLoader=1\r\n"
+    "\r\n"
+    "; SpeedLists can be played alone in friends-only and invite-only games\r\n"
+    "SoloMP=1\r\n"
     "\r\n"
     "; upscaler settings\r\n"
     "Upscaler=1\r\n"
     "UpscaleQuality=0\r\n"
     "\r\n"
-    "; 1 = write NFS13Fix.log\r\n"
+    "; write NFS13Fix.log\r\n"
     "Log=0\r\n";
+
+// writes the ini in the current layout when it is missing or lacks a current key, keeping the
+// user's values and any keys the layout does not know
+void Upgrade(const char* ini)
+{
+    std::string out, keys;
+    bool missing = false;
+    char value[256];
+    for (const char* line = kDefaults; *line;) {
+        const char* end = strstr(line, "\r\n");
+        std::string l(line, end);
+        line = end + 2;
+        const size_t eq = l.find('=');
+        if (l[0] != ';' && l[0] != '[' && eq != std::string::npos) {
+            const std::string key = l.substr(0, eq);
+            keys += "|" + key + "|";
+            if (GetPrivateProfileStringA("Fix", key.c_str(), "\x01", value, sizeof(value), ini) && value[0] != 1)
+                l = key + "=" + value;
+            else
+                missing = true;
+        }
+        out += l + "\r\n";
+    }
+    if (!missing)
+        return;
+
+    std::vector<char> section(32768);
+    GetPrivateProfileSectionA("Fix", section.data(), static_cast<DWORD>(section.size()), ini);
+    for (const char* kv = section.data(); *kv; kv += strlen(kv) + 1) {
+        const char* eq = strchr(kv, '=');
+        if (eq && keys.find("|" + std::string(kv, eq) + "|") == std::string::npos)
+            out += std::string(kv) + "\r\n";
+    }
+
+    FILE* f = nullptr;
+    if (fopen_s(&f, ini, "wb") == 0 && f) {
+        fwrite(out.data(), 1, out.size(), f);
+        fclose(f);
+    }
+}
 
 } // namespace
 
@@ -39,23 +84,7 @@ const Settings& Load(HMODULE self)
     if (char* dot = strrchr(ini, '.'))
         strcpy_s(dot, ini + MAX_PATH - dot, ".ini");
 
-    if (GetFileAttributesA(ini) == INVALID_FILE_ATTRIBUTES) {
-        FILE* f = nullptr;
-        if (fopen_s(&f, ini, "wb") == 0 && f) {
-            fwrite(kDefaults, 1, sizeof(kDefaults) - 1, f);
-            fclose(f);
-        }
-    }
-    // older ini files: add the log switch so it can be found
-    char probe[8];
-    if (!GetPrivateProfileStringA("Fix", "Log", "", probe, sizeof(probe), ini)) {
-        FILE* f = nullptr;
-        if (fopen_s(&f, ini, "ab") == 0 && f) {
-            const char add[] = "\r\n; 1 = write NFS13Fix.log\r\nLog=0\r\n";
-            fwrite(add, 1, sizeof(add) - 1, f);
-            fclose(f);
-        }
-    }
+    Upgrade(ini);
 
     auto get = [&](const char* key, int def) {
         return static_cast<int>(GetPrivateProfileIntA("Fix", key, def, ini));
@@ -64,6 +93,7 @@ const Settings& Load(HMODULE self)
     g_settings.borderless = get("Borderless", 1) != 0;
     g_settings.sdlInput = get("SDLInput", 1) != 0;
     g_settings.modLoader = get("ModLoader", 1) != 0;
+    g_settings.soloMP = get("SoloMP", 1) != 0;
     g_settings.upscaler = get("Upscaler", 1);
     g_settings.upscaleQuality = get("UpscaleQuality", 0);
     g_settings.sharpness = get("Sharpness", 0);

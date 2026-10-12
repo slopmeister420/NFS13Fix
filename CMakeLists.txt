@@ -37,6 +37,7 @@ add_library(nfs13fix SHARED
     src/dllmain.cpp
     src/framerate.cpp
     src/renderscale.cpp
+    src/speedlist.cpp
     src/upscale.cpp
     src/upscaling.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/gen/upscale_prep_cs.h

@@ -9,6 +9,7 @@ struct Settings {
     bool borderless = true;
     bool sdlInput = true;
     bool modLoader = true;
+    bool soloMP = true; // speedlists alone in friends-only / invite-only games
     int upscaler = 1;       // 0 off, 1 dlss, 2 fsr
     int upscaleQuality = 0; // 0 native aa, 1 quality, 2 balanced, 3 performance, 4 ultra performance
     int sharpness = 0;      // fsr sharpening, percent
