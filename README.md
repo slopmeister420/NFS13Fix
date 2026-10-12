@@ -6,6 +6,14 @@ without the game speeding up, and any controller supported by SDL works out of t
 It also adds DLSS and FSR, and a simple mod loader: files placed in a `mods` folder next to the game replace the game's own files,
 with no repacking needed.
 
+## Features
+
+* Borderless window
+* Unlocked frame rate
+* SDL controller input
+* DLSS and FSR
+* Mod loader
+
 ## Installation
 
 Install [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader/releases) (32-bit)
