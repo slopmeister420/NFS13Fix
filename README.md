@@ -21,6 +21,11 @@ Install [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader/
 
 Then extract the release archive into the game directory. Settings are stored in `NFS13Fix.ini`, created on first launch.
 
+## Controllers
+
+To use the SDL controller support, turn off Steam Input for the game (Steam > the game's Properties > Controller >
+Disable Steam Input). With Steam Input on, Steam takes over the controller and the game only sees Steam's own virtual pad.
+
 ## The mods folder
 
 The release ships with a `mods` folder that adds upscaling options to Settings > Graphics. If another mod already replaces the settings
