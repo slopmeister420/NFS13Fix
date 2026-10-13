@@ -31,6 +31,8 @@ Disable Steam Input). With Steam Input on, Steam takes over the controller and t
 The release ships with a `mods` folder that adds upscaling options to Settings > Graphics. If another mod already replaces the settings
 screen or the game's text, leave it out; upscaling can still be configured in `NFS13Fix.ini`.
 
+![Upscaling options in Settings > Graphics](docs/upscaling.png)
+
 ## Compilation requirements
 
 * Visual Studio 2022 with the C++ desktop workload, CMake 3.21 or newer and the Windows SDK.
