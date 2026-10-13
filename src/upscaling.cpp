@@ -43,7 +43,7 @@ int ToSel(int backend, int quality) { return backend == 1 ? 1 + quality : backen
 bool Active() { return g_sel > 0 && !g_failed; }
 
 // device context vtable
-constexpr size_t kPSSetSamplers = 10, kOMSetRenderTargets = 33, kUpdateSubresource = 48;
+constexpr size_t kDrawIndexed = 12, kDraw = 13, kPSSetSamplers = 10, kOMSetRenderTargets = 33, kUpdateSubresource = 48;
 // contexts of devices created with different flags have different vtables
 struct ContextVmt {
     lm_address_t* vtable;
@@ -57,6 +57,8 @@ using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT
 using PSSetSamplersFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, ID3D11SamplerState* const*);
 using UpdateSubresourceFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Resource*, UINT, const D3D11_BOX*,
                                                      const void*, UINT, UINT);
+using DrawFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT);
+using DrawIndexedFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT);
 
 template <typename Fn> Fn Original(ID3D11DeviceContext* ctx, size_t i)
 {
@@ -270,7 +272,7 @@ void DropCaches();
 void TrackParticles(ID3D11DeviceContext* ctx);
 void EndFrame();
 bool UpscaleFrame(ID3D11DeviceContext* ctx);
-ID3D11RenderTargetView* Dummy(ID3D11DeviceContext* ctx, UINT w, UINT h);
+bool g_blitPending = false; // our upscale is on the backbuffer: the game's own blit there is still to come
 
 // the menu changed the choice: switch the helper over on the render thread
 void ApplyPending()
@@ -291,6 +293,7 @@ void STDMETHODCALLTYPE HookedOMSetRenderTargets(ID3D11DeviceContext* ctx, UINT n
                                                 ID3D11DepthStencilView* dsv)
 {
     const auto orig = Original<OMSetRenderTargetsFn>(ctx, kOMSetRenderTargets);
+    g_blitPending = false;
     InstallMenu();
     // drop cached views when the rebuild starts and again once the old targets are gone
     static uint32_t calls = 0, dropAgain = 0;
@@ -368,17 +371,14 @@ void STDMETHODCALLTYPE HookedOMSetRenderTargets(ID3D11DeviceContext* ctx, UINT n
         g_last = g_rt0;
     if (backbuffer) {
         g_sceneActive = false;
-        // the game's fxaa blit (and letterbox quads) go to a scratch target; binding it first also
-        // unbinds the scene colour, which the upscaler reads
-        if (ID3D11RenderTargetView* dummy = Dummy(ctx, g_rt0.w, g_rt0.h)) {
-            orig(ctx, 1, &dummy, nullptr);
-            const bool done = UpscaleFrame(ctx);
-            EndFrame();
-            if (done)
-                return;
-        } else {
-            EndFrame();
-        }
+        // binding the backbuffer unbinds the scene colour, which the upscaler reads. the game's
+        // fxaa blit that follows is skipped (SkipBlit); the ui it draws there (callouts pinned to the
+        // car) still lands on the upscaled frame
+        orig(ctx, n, rtvs, dsv);
+        g_blitPending = UpscaleFrame(ctx);
+        EndFrame();
+        HookVariants(ctx);
+        return;
     }
     orig(ctx, n, rtvs, dsv);
 }
@@ -524,10 +524,14 @@ void TagObject(ID3D11DeviceContext* ctx, const float* world)
     dss->Release();
 }
 
-UpdateSubresourceFn g_usTramp[4]{};
-void* g_usTarget[4]{};
-int g_usCount = 0;
-
+// d3d11 swaps the context's own entries for these as state changes: every implementation it
+// switches to is detoured inline
+struct Variants {
+    void* target[4]{};
+    void* tramp[4]{};
+    int count = 0;
+};
+Variants g_us, g_draw, g_drawIndexed;
 
 void UpdateSubresourceImpl(UpdateSubresourceFn orig, ID3D11DeviceContext* ctx, ID3D11Resource* dst, UINT sub,
                            const D3D11_BOX* box, const void* data, UINT pitch, UINT depthPitch)
@@ -627,36 +631,92 @@ template <int N>
 void STDMETHODCALLTYPE HookedUpdateSubresource(ID3D11DeviceContext* ctx, ID3D11Resource* dst, UINT sub,
                                                const D3D11_BOX* box, const void* data, UINT pitch, UINT depthPitch)
 {
-    UpdateSubresourceImpl(g_usTramp[N], ctx, dst, sub, box, data, pitch, depthPitch);
+    UpdateSubresourceImpl(reinterpret_cast<UpdateSubresourceFn>(g_us.tramp[N]), ctx, dst, sub, box, data, pitch,
+                          depthPitch);
 }
 
-constexpr UpdateSubresourceFn kUsHooks[4] = {&HookedUpdateSubresource<0>, &HookedUpdateSubresource<1>,
-                                            &HookedUpdateSubresource<2>, &HookedUpdateSubresource<3>};
-
-// detour whichever UpdateSubresource implementation the context currently points at
-void HookVariants(ID3D11DeviceContext* ctx)
+// after our upscale the game draws its fxaa blit (reads the finished scene colour) and, when the
+// scene is scaled, untextured black quads around the band the blit filled. those are skipped; the
+// first other draw (ui, e.g. callouts pinned to the car) ends the skipping
+bool SkipBlit(ID3D11DeviceContext* ctx)
 {
-    void* fn = (*reinterpret_cast<void***>(ctx))[kUpdateSubresource];
-    for (int k = 0; k < g_usCount; ++k)
-        if (g_usTarget[k] == fn || reinterpret_cast<void*>(kUsHooks[k]) == fn)
+    if (!g_blitPending)
+        return false;
+    ID3D11ShaderResourceView* srvs[4]{};
+    ctx->PSGetShaderResources(0, 4, srvs);
+    bool scene = false, textured = false;
+    for (ID3D11ShaderResourceView* v : srvs) {
+        if (!v)
+            continue;
+        textured = true;
+        ID3D11Resource* r = nullptr;
+        v->GetResource(&r);
+        scene |= r && r == static_cast<ID3D11Resource*>(g_sceneColor);
+        if (r)
+            r->Release();
+        v->Release();
+    }
+    if (scene || !textured)
+        return true;
+    g_blitPending = false;
+    return false;
+}
+
+template <int N>
+void STDMETHODCALLTYPE HookedDraw(ID3D11DeviceContext* ctx, UINT count, UINT start)
+{
+    if (!SkipBlit(ctx))
+        reinterpret_cast<DrawFn>(g_draw.tramp[N])(ctx, count, start);
+}
+
+template <int N>
+void STDMETHODCALLTYPE HookedDrawIndexed(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base)
+{
+    if (!SkipBlit(ctx))
+        reinterpret_cast<DrawIndexedFn>(g_drawIndexed.tramp[N])(ctx, count, start, base);
+}
+
+void* const kUsHooks[4] = {reinterpret_cast<void*>(&HookedUpdateSubresource<0>),
+                           reinterpret_cast<void*>(&HookedUpdateSubresource<1>),
+                           reinterpret_cast<void*>(&HookedUpdateSubresource<2>),
+                           reinterpret_cast<void*>(&HookedUpdateSubresource<3>)};
+void* const kDrawHooks[4] = {reinterpret_cast<void*>(&HookedDraw<0>), reinterpret_cast<void*>(&HookedDraw<1>),
+                             reinterpret_cast<void*>(&HookedDraw<2>), reinterpret_cast<void*>(&HookedDraw<3>)};
+void* const kDrawIndexedHooks[4] = {
+    reinterpret_cast<void*>(&HookedDrawIndexed<0>), reinterpret_cast<void*>(&HookedDrawIndexed<1>),
+    reinterpret_cast<void*>(&HookedDrawIndexed<2>), reinterpret_cast<void*>(&HookedDrawIndexed<3>)};
+
+// detour whichever implementation of a slot the context currently points at
+void HookVariant(ID3D11DeviceContext* ctx, size_t slot, Variants& v, void* const* hooks, const char* what)
+{
+    void* fn = (*reinterpret_cast<void***>(ctx))[slot];
+    for (int k = 0; k < 4; ++k)
+        if ((k < v.count && v.target[k] == fn) || hooks[k] == fn)
             return;
-    if (g_usCount == 4)
+    if (v.count == 4)
         return;
     const auto* b = static_cast<const uint8_t*>(fn);
     if (!(b[0] == 0x8B && b[1] == 0xFF && b[2] == 0x55)) { // mov edi,edi; push ebp
-        LOGF("[upscale] UpdateSubresource at %p has an unexpected prologue, not hooking", fn);
-        g_usTarget[g_usCount++] = fn; // remember so we do not retry
+        LOGF("[upscale] %s at %p has an unexpected prologue, not hooking", what, fn);
+        v.target[v.count++] = fn; // remember so we do not retry
         return;
     }
     lm_address_t tramp = 0;
-    if (!LM_HookCode(reinterpret_cast<lm_address_t>(fn), reinterpret_cast<lm_address_t>(kUsHooks[g_usCount]), &tramp)) {
-        LOGF("[upscale] could not detour UpdateSubresource at %p", fn);
-        g_usTarget[g_usCount++] = fn;
+    if (!LM_HookCode(reinterpret_cast<lm_address_t>(fn), reinterpret_cast<lm_address_t>(hooks[v.count]), &tramp)) {
+        LOGF("[upscale] could not detour %s at %p", what, fn);
+        v.target[v.count++] = fn;
         return;
     }
-    g_usTramp[g_usCount] = reinterpret_cast<UpdateSubresourceFn>(tramp);
-    g_usTarget[g_usCount++] = fn;
-    LOGF("[upscale] UpdateSubresource variant %p detoured", fn);
+    v.tramp[v.count] = reinterpret_cast<void*>(tramp);
+    v.target[v.count++] = fn;
+    LOGF("[upscale] %s variant %p detoured", what, fn);
+}
+
+void HookVariants(ID3D11DeviceContext* ctx)
+{
+    HookVariant(ctx, kUpdateSubresource, g_us, kUsHooks, "UpdateSubresource");
+    HookVariant(ctx, kDraw, g_draw, kDrawHooks, "Draw");
+    HookVariant(ctx, kDrawIndexed, g_drawIndexed, kDrawIndexedHooks, "DrawIndexed");
 }
 
 void EndFrame()
@@ -709,30 +769,6 @@ ID3D11ShaderResourceView* ColorSrv(ID3D11DeviceContext* ctx, ID3D11Texture2D* te
     }
     format = it->second.second;
     return it->second.first;
-}
-
-// a target for the game's own fxaa blit to land in once we have drawn the frame
-ID3D11RenderTargetView* Dummy(ID3D11DeviceContext* ctx, UINT w, UINT h)
-{
-    static ID3D11RenderTargetView* rtv = nullptr;
-    static UINT dw = 0, dh = 0;
-    if (rtv && dw == w && dh == h)
-        return rtv;
-    if (rtv)
-        rtv->Release();
-    rtv = nullptr;
-    ID3D11Device* dev = nullptr;
-    ctx->GetDevice(&dev);
-    D3D11_TEXTURE2D_DESC d{w, h, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET};
-    ID3D11Texture2D* t = nullptr;
-    if (SUCCEEDED(dev->CreateTexture2D(&d, nullptr, &t))) {
-        dev->CreateRenderTargetView(t, nullptr, &rtv);
-        t->Release();
-    }
-    dev->Release();
-    dw = w;
-    dh = h;
-    return rtv;
 }
 
 // the backbuffer is about to receive the finished scene: upscale it there ourselves
