@@ -4,7 +4,8 @@ NFS13Fix is a plugin for the PC version of Need for Speed: Most Wanted (2012) th
 and adds a few modern options. The game runs in a borderless window instead of exclusive fullscreen, the 60 FPS cap is removed
 without the game speeding up, and any controller supported by SDL works out of the box.
 It also adds DLSS and FSR, and a simple mod loader: files placed in a `mods` folder next to the game replace the game's own files,
-with no repacking needed. SpeedLists can also be played alone in friends-only and invite-only online games.
+with no repacking needed. SpeedLists can also be played alone in friends-only and invite-only online games,
+and a car the game does not have (such as another player's add-on car) loads a stand-in instead of freezing.
 
 ## Features
 
@@ -14,6 +15,8 @@ with no repacking needed. SpeedLists can also be played alone in friends-only an
 * DLSS and FSR
 * Mod loader
 * Solo SpeedLists in private games
+* Stand-in car for vehicles the game does not have
+* Fewer random Autolog disconnects
 
 ## Installation
 

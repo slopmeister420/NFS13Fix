@@ -28,6 +28,9 @@ const char kDefaults[] =
     "; SpeedLists can be played alone in friends-only and invite-only games\r\n"
     "SoloMP=1\r\n"
     "\r\n"
+    "; vehicle id used in place of a car the game does not have: 0 = off\r\n"
+    "StandInCar=1399539\r\n"
+    "\r\n"
     "; upscaler settings\r\n"
     "Upscaler=1\r\n"
     "UpscaleQuality=0\r\n"
@@ -94,6 +97,7 @@ const Settings& Load(HMODULE self)
     g_settings.sdlInput = get("SDLInput", 1) != 0;
     g_settings.modLoader = get("ModLoader", 1) != 0;
     g_settings.soloMP = get("SoloMP", 1) != 0;
+    g_settings.standInCar = get("StandInCar", 1399539);
     g_settings.upscaler = get("Upscaler", 1);
     g_settings.upscaleQuality = get("UpscaleQuality", 0);
     g_settings.sharpness = get("Sharpness", 0);
