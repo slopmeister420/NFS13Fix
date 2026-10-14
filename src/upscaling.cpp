@@ -536,7 +536,7 @@ Variants g_us, g_draw, g_drawIndexed;
 void UpdateSubresourceImpl(UpdateSubresourceFn orig, ID3D11DeviceContext* ctx, ID3D11Resource* dst, UINT sub,
                            const D3D11_BOX* box, const void* data, UINT pitch, UINT depthPitch)
 {
-    if (box || !data || !Active() || !InScene())
+    if (!dst || box || !data || !Active() || !InScene())
         return orig(ctx, dst, sub, box, data, pitch, depthPitch);
     auto it = g_cbuffers.find(dst);
     if (it == g_cbuffers.end()) {
