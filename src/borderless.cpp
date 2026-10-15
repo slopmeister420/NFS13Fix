@@ -5,7 +5,8 @@
 // ResizeTarget + SetFullscreenState(FALSE) on every focus loss, then goes back in - the
 // mode switch is what makes alt-tab so violent. The game's own window is already
 // caption-less (WS_SYSMENU|WS_MINIMIZEBOX) and it never moves or sizes it, so borderless is
-// just: never go exclusive, and size the window to the monitor ourselves.
+// just: never go exclusive, and place the window ourselves - the whole monitor, or the
+// game's resolution centred on it.
 //
 // Only DXGI vtables and the render window are touched - no game-code addresses. The
 // vtables come from a throwaway factory and swapchain made on our own thread, because the
@@ -13,11 +14,14 @@
 
 #include "borderless.h"
 #include "log.h"
+#include "renderscale.h"
 
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
 #include <libmem/libmem.h>
+
+#include <algorithm>
 
 
 namespace borderless {
@@ -115,6 +119,43 @@ RECT g_target{};
 bool g_haveTarget = false;
 bool g_applying = false;
 WNDPROC g_origWndProc = nullptr;
+// the game's resolution, and the backbuffer size, which the game never changes after creating
+// the swapchain: it draws a new resolution into the top-left corner of the same buffers
+volatile LONG g_modeW = 0, g_modeH = 0;
+LONG g_bufW = 0, g_bufH = 0;
+LONG g_rgnW = -1, g_rgnH = -1;
+
+bool Centred(const RECT& mon)
+{
+    const LONG w = g_modeW, h = g_modeH;
+    return w > 0 && h > 0 && w <= g_bufW && h <= g_bufH && w <= mon.right - mon.left &&
+           h <= mon.bottom - mon.top && (w < g_bufW || h < g_bufH);
+}
+
+// a smaller resolution: the buffer-sized window placed so the drawn corner sits in the middle
+// of the monitor, clipped to that corner so the desktop shows around it
+RECT Target(const RECT& mon)
+{
+    if (!Centred(mon))
+        return mon;
+    const LONG x = mon.left + (mon.right - mon.left - g_modeW) / 2;
+    const LONG y = mon.top + (mon.bottom - mon.top - g_modeH) / 2;
+    return {x, y, x + g_bufW, y + g_bufH};
+}
+
+// on the window's own thread: setting a region from elsewhere can wait on it
+void UpdateRegion(HWND h)
+{
+    MONITORINFO mi{sizeof(mi)};
+    GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY), &mi);
+    const bool centred = Centred(mi.rcMonitor);
+    const LONG w = centred ? g_modeW : 0, hh = centred ? g_modeH : 0;
+    if (w == g_rgnW && hh == g_rgnH)
+        return;
+    g_rgnW = w;
+    g_rgnH = hh;
+    SetWindowRgn(h, centred ? CreateRectRgn(0, 0, w, hh) : nullptr, TRUE);
+}
 
 // WS_MINIMIZEBOX stays: without it the taskbar button cannot minimise the game
 constexpr LONG kBorderStyle =
@@ -143,6 +184,8 @@ LRESULT CALLBACK SubclassProc(HWND h, UINT msg, WPARAM w, LPARAM l)
             }
         }
     }
+    if (h == g_hwnd && msg == WM_WINDOWPOSCHANGED)
+        UpdateRegion(h);
     return CallWindowProcW(g_origWndProc, h, msg, w, l);
 }
 
@@ -156,7 +199,7 @@ void ApplyBorderless(HWND hwnd)
     MONITORINFO mi{sizeof(mi)};
     if (!GetMonitorInfoW(mon, &mi))
         return;
-    g_target = mi.rcMonitor;
+    g_target = Target(mi.rcMonitor);
     g_haveTarget = true;
 
     const LONG style = GetWindowLongW(hwnd, GWL_STYLE);
@@ -166,6 +209,8 @@ void ApplyBorderless(HWND hwnd)
     RECT now{};
     GetWindowRect(hwnd, &now);
 
+    if (GetWindowThreadProcessId(hwnd, nullptr) == GetCurrentThreadId())
+        UpdateRegion(hwnd);
     if (style != wantStyle || ex != wantEx || !EqualRect(&now, &g_target)) {
         g_applying = true;
         SetWindowLongW(hwnd, GWL_STYLE, wantStyle);
@@ -189,6 +234,21 @@ void ApplyBorderless(HWND hwnd)
         LOGF("[win] subclassed (original wndproc %p)", reinterpret_cast<void*>(g_origWndProc));
     }
 }
+
+} // namespace
+
+void SetMode(UINT w, UINT h)
+{
+    if (!w || !h || (static_cast<LONG>(w) == g_modeW && static_cast<LONG>(h) == g_modeH))
+        return;
+    InterlockedExchange(&g_modeW, static_cast<LONG>(w));
+    InterlockedExchange(&g_modeH, static_cast<LONG>(h));
+    LOGF("[win] game resolution %ux%u", w, h);
+    if (g_hwnd)
+        ApplyBorderless(g_hwnd);
+}
+
+namespace {
 
 // ---------------------------------------------------------- dxgi hooks
 
@@ -222,23 +282,24 @@ HRESULT STDMETHODCALLTYPE HookedCreateSwapChain(IDXGIFactory* self, IUnknown* de
     DXGI_SWAP_CHAIN_DESC d = *desc;
     d.Windowed = TRUE;
     d.Flags &= ~DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+    // at least monitor-sized, so a resolution picked later up to the monitor's still fits
+    MONITORINFO mi{sizeof(mi)};
+    if (d.OutputWindow &&
+        GetMonitorInfoW(MonitorFromWindow(d.OutputWindow, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+        d.BufferDesc.Width = std::max(d.BufferDesc.Width, static_cast<UINT>(mi.rcMonitor.right - mi.rcMonitor.left));
+        d.BufferDesc.Height = std::max(d.BufferDesc.Height, static_cast<UINT>(mi.rcMonitor.bottom - mi.rcMonitor.top));
+    }
 
     HRESULT hr = Original<CreateSwapChainFn>(g_createSwapChain)(self, device, &d, out);
     LOGF("[dxgi] CreateSwapChain -> %08lX", hr);
     if (SUCCEEDED(hr) && d.OutputWindow) {
         // stops DXGI turning Alt+Enter into an exclusive-mode switch of its own
         self->MakeWindowAssociation(d.OutputWindow, DXGI_MWA_NO_ALT_ENTER);
+        g_bufW = d.BufferDesc.Width;
+        g_bufH = d.BufferDesc.Height;
+        LOGF("[dxgi] backbuffer %ldx%ld", g_bufW, g_bufH);
+        SetMode(desc->BufferDesc.Width, desc->BufferDesc.Height);
         ApplyBorderless(d.OutputWindow);
-
-        MONITORINFO mi{sizeof(mi)};
-        GetMonitorInfoW(MonitorFromWindow(d.OutputWindow, MONITOR_DEFAULTTOPRIMARY), &mi);
-        const LONG mw = mi.rcMonitor.right - mi.rcMonitor.left;
-        const LONG mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
-        if (static_cast<LONG>(d.BufferDesc.Width) != mw ||
-            static_cast<LONG>(d.BufferDesc.Height) != mh)
-            LOGF("[dxgi] note: rendering %ux%u on a %ldx%ld monitor - set the in-game "
-                 "resolution to the monitor's for a sharp picture",
-                 d.BufferDesc.Width, d.BufferDesc.Height, mw, mh);
     }
     return hr;
 }
@@ -269,7 +330,8 @@ HRESULT STDMETHODCALLTYPE HookedGetFullscreenState(IDXGISwapChain* sc, BOOL* fs,
     return S_OK;
 }
 
-// would size the window to the render mode; the window belongs to the monitor now
+// would size the window to the render mode; we place it ourselves. not a mode source either:
+// focus loss passes the resolution the game started with
 HRESULT STDMETHODCALLTYPE HookedResizeTarget(IDXGISwapChain* sc, const DXGI_MODE_DESC* mode)
 {
     Reentry guard;
@@ -364,6 +426,7 @@ DWORD WINAPI Startup(LPVOID)
 
 void Init()
 {
+    renderscale::Watch([](uint32_t w, uint32_t h) { SetMode(w, h); });
     // never do D3D work under the loader lock
     HANDLE t = CreateThread(nullptr, 0, Startup, nullptr, 0, nullptr);
     if (t)

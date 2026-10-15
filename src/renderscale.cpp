@@ -13,6 +13,8 @@ namespace renderscale {
 namespace {
 
 SizeFn g_size = nullptr;
+WatchFn g_watch = nullptr;
+volatile LONG g_started = 0;
 uint32_t g_displayW = 0;
 
 // called from the cave with the display size the scene targets are about to be built from
@@ -20,7 +22,10 @@ void __stdcall Apply(uint32_t* wh)
 {
     uint32_t w = wh[0], h = wh[1];
     g_displayW = w;
-    g_size(wh[0], wh[1], w, h);
+    if (g_watch)
+        g_watch(w, h);
+    if (g_size)
+        g_size(wh[0], wh[1], w, h);
     LOGF("[scale] scene targets %ux%u for display %ux%u", w, h, wh[0], wh[1]);
     wh[0] = w;
     wh[1] = h;
@@ -102,13 +107,26 @@ DWORD WINAPI Waiter(LPVOID)
     return 0;
 }
 
+void Start()
+{
+    if (InterlockedExchange(&g_started, 1))
+        return;
+    if (HANDLE t = CreateThread(nullptr, 0, Waiter, nullptr, 0, nullptr))
+        CloseHandle(t);
+}
+
 } // namespace
 
 void Init(SizeFn size)
 {
     g_size = size;
-    if (HANDLE t = CreateThread(nullptr, 0, Waiter, nullptr, 0, nullptr))
-        CloseHandle(t);
+    Start();
+}
+
+void Watch(WatchFn watch)
+{
+    g_watch = watch;
+    Start();
 }
 
 uint32_t DisplayWidth()

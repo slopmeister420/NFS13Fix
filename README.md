@@ -9,7 +9,7 @@ and a car the game does not have (such as another player's add-on car) loads a s
 
 ## Features
 
-* Borderless window
+* Borderless window (a lower resolution sits centred on the desktop)
 * Unlocked frame rate
 * SDL controller input
 * DLSS and FSR
