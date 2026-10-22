@@ -1,7 +1,10 @@
 // A vehicle id with no bundle never finishes loading: the local player is left frozen without a
-// car, and in an online game everyone else keeps waiting on it. Such an id is swapped for a
-// stand-in car where a racer's car changes and where its vehicle settings are stored. The player's
-// own car loads its _HI bundle and every other racer's its _LO one, so that is the file required.
+// car, and in an online game everyone else keeps waiting on it. An id the vehicle list does not
+// know (another player's add-on car) is read past the list and crashes. Such an id is swapped for a
+// stand-in car where a racer's car changes, where its vehicle settings are stored, and where a race
+// car is loaded, which is also where another player's car change arrives from the network. The
+// player's own car loads its _HI bundle and every other racer's its _LO one, so that is the file
+// required.
 
 #include "standin.h"
 #include "log.h"
@@ -33,12 +36,35 @@ const char kChangeSig[] = "55 8B EC 83 E4 F8 81 EC B4 00 00 00 53 8B D9 8B 83 A0
 const char kChangeWorldSig[] = "8B 8B ?? ?? ?? ?? 50 81 C1";
 constexpr size_t kChangeWorldAt = 0x2a;
 
+// RaceCarEntityModule::LoadRaceCar(slot, vehicle id, livery id, flag), thiscall
+const char kLoadSig[] = "83 EC 10 53 55 56 8B 74 24 20 8B EE 69 ED 40 1C 00 00 8B D9 03 EB 80 BD 6A 30 00 00 00";
+constexpr size_t kCarStride = 0x1c40;
+// lea esi,[ebx+vehicle list]; push edx; mov ecx,esi; call FindVehicleIndexById
+const char kLoadFindSig[] = "8D B3 ?? ?? ?? ?? 52 8B CE E8";
+constexpr size_t kLoadFindAt = 0x48;
+// mov [ebp+field],eax / mov [ebp+field],edx: the vehicle and livery ids a car was loaded with
+const char kLoadIdSig[] = "89 85 ?? ?? 00 00";
+const char kLoadLiverySig[] = "89 95 ?? ?? 00 00";
+constexpr size_t kLoadIdAt = 0x93, kLoadLiveryAt = 0x152;
+// push esi; mov esi,ecx; mov ecx,[game logic]; call GetLocalVehicleIndex; cmp eax,-1; je; mov ecx,eax; imul ecx,stride
+const char kLocalSlotSig[] = "56 8B F1 8B 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 83 F8 FF 0F 84 ?? ?? ?? ?? 8B C8 69 C9 40 1C 00 00";
+// which reads mov eax,[ecx+world]; mov ecx,[eax+manager] with no null checks
+const char kLocalSlotFnSig[] = "8B 41 ?? 8B 88 ?? ?? ?? ??";
+
 using SetFn = void(__fastcall*)(void* self, void* edx, int racer, const uint8_t* settings, int mode);
 using ChangeFn = void(__fastcall*)(void* racer, void* edx, uint32_t id, uint32_t livery, const uint8_t* settings);
 using LocalFn = uint8_t*(__fastcall*)(void* manager, void* edx);
+using LoadFn = void(__fastcall*)(uint8_t* self, void* edx, int slot, uint32_t id, uint32_t livery, int flag);
+using FindFn = int(__fastcall*)(void* list, void* edx, uint32_t id);
+using SlotFn = int(__fastcall*)(void* gameLogic, void* edx);
 SetFn g_set = nullptr;
 ChangeFn g_change = nullptr;
 LocalFn g_localRacer = nullptr;
+LoadFn g_load = nullptr;
+FindFn g_findIndex = nullptr;
+SlotFn g_localSlot = nullptr;
+uintptr_t g_gameLogic = 0;
+uint32_t g_offList = 0, g_offCarId = 0, g_offCarLivery = 0, g_offLogicWorld = 0, g_offLogicManager = 0;
 uint32_t g_offManager = 0, g_offIndex = 0, g_offRacerWorld = 0;
 uint32_t g_standIn = 0;
 std::wstring g_dir; // game folder, with a trailing backslash
@@ -114,6 +140,53 @@ void __fastcall ChangeVehicle(void* racer, void*, uint32_t id, uint32_t livery, 
     g_change(racer, nullptr, id, livery, settings);
 }
 
+void __fastcall LoadRaceCar(uint8_t* self, void*, int slot, uint32_t id, uint32_t livery, int flag)
+{
+    const bool listed = g_findIndex(self + g_offList, nullptr, id) >= 0;
+    // unknown counts as the player, as above
+    const uint32_t gameLogic = U32(g_gameLogic);
+    const uint32_t world = gameLogic ? U32(gameLogic + g_offLogicWorld) : 0;
+    const bool local = !world || !U32(world + g_offLogicManager) ||
+                       g_localSlot(reinterpret_cast<void*>(gameLogic), nullptr) == slot;
+    if (id && id != g_standIn && (!listed || !HasBundle(id, local))) {
+        LOGF("[standin] race car %d: vehicle %u is %s, using %u", slot, id,
+             listed ? (local ? "missing its _HI bundle" : "missing its _LO bundle") : "not in the vehicle list", g_standIn);
+        g_load(self, nullptr, slot, g_standIn, 0, flag);
+        // keep the ids that were asked for, or every network update for this car reloads it
+        uint8_t* car = self + slot * kCarStride;
+        memcpy(car + g_offCarId, &id, sizeof(id));
+        memcpy(car + g_offCarLivery, &livery, sizeof(livery));
+        return;
+    }
+    g_load(self, nullptr, slot, id, livery, flag);
+}
+
+// the race car loader hook; false leaves it off
+bool InstallLoad(const lm_module_t& mod)
+{
+    const lm_address_t load = LM_SigScan(kLoadSig, mod.base, mod.size);
+    const lm_address_t local = LM_SigScan(kLocalSlotSig, mod.base, mod.size);
+    if (load == LM_ADDRESS_BAD || local == LM_ADDRESS_BAD || !Matches(load + kLoadFindAt, kLoadFindSig) ||
+        !Matches(load + kLoadIdAt, kLoadIdSig) || !Matches(load + kLoadLiveryAt, kLoadLiverySig))
+        return false;
+    g_offList = U32(load + kLoadFindAt + 2);
+    g_findIndex = reinterpret_cast<FindFn>(load + kLoadFindAt + 14 + static_cast<int32_t>(U32(load + kLoadFindAt + 10)));
+    g_offCarId = U32(load + kLoadIdAt + 2);
+    g_offCarLivery = U32(load + kLoadLiveryAt + 2);
+    g_gameLogic = U32(local + 5);
+    const lm_address_t slotFn = local + 14 + static_cast<int32_t>(U32(local + 10));
+    if (!Matches(slotFn, kLocalSlotFnSig))
+        return false;
+    g_localSlot = reinterpret_cast<SlotFn>(slotFn);
+    g_offLogicWorld = *reinterpret_cast<const uint8_t*>(slotFn + 2);
+    g_offLogicManager = U32(slotFn + 5);
+    lm_address_t tramp = 0;
+    if (!LM_HookCode(load, reinterpret_cast<lm_address_t>(&LoadRaceCar), &tramp))
+        return false;
+    g_load = reinterpret_cast<LoadFn>(tramp);
+    return true;
+}
+
 bool TryInstall()
 {
     lm_module_t mod;
@@ -140,6 +213,8 @@ bool TryInstall()
     }
     g_set = reinterpret_cast<SetFn>(a);
     g_change = reinterpret_cast<ChangeFn>(b);
+    if (!InstallLoad(mod))
+        LOGF("[standin] race car loader not found - other players' unknown cars are not replaced");
     LOGF("[standin] cars without a bundle are replaced by %u (setter %p, change %p)", g_standIn,
          reinterpret_cast<void*>(set), reinterpret_cast<void*>(change));
     return true;
