@@ -4,7 +4,8 @@
 // make it return a higher rate before that happens, and scale the cap on catch-up ticks per
 // frame (3 at 60) with it, so slow frames still keep real time. Traffic only updated at the
 // stock step sizes, so its 10 Hz timer is rewritten to work at any rate, and the engine sound
-// synth froze its pitch when updated this often, so its glide is fixed too.
+// synth froze its pitch when updated this often, so its glide is fixed too. Volume emitters
+// (rain) spawned per frame, so they now spawn per second.
 
 #include "framerate.h"
 #include "log.h"
@@ -214,6 +215,55 @@ void PatchExhaust(const std::vector<std::pair<uint8_t*, uint8_t*>>& ranges)
     LOGF("[fps] exhaust pops and flames on a 60 Hz cadence");
 }
 
+const float kSixty = 60.0f, kMaxScale = 3.0f, kOne = 1.0f;
+uint32_t g_seed = 0x2545F491;
+uint32_t g_scratch;
+
+// volume emitters (rain, ambient particles) spawn a fixed count per rendered frame, so they
+// spawn more per second above 60 fps. scale the count by dt * 60, dithered so the fraction
+// isn't lost to the truncation.
+void PatchVolumeEmitter(const std::vector<std::pair<uint8_t*, uint8_t*>>& ranges)
+{
+    // count = binding * mfNumParticles: fld [eax+edx*4]; mulps; fmul [esi+0x88]
+    static const Pattern kSpawn = Parse(
+        "0F B6 96 D9 00 00 00 0F 28 57 30 0F 58 C4 D9 04 90 0F 59 47 20 D8 8E 88 00 00 00 0F 58 C2");
+    // earlier in the same function: movss xmm1,[ecx+0x64] (ecx = sim interface, +0x64 = frame dt)
+    static const uint8_t kDt[] = {0xF3, 0x0F, 0x10, 0x49, 0x64};
+    const auto spawn = FindAll(ranges, kSpawn);
+    if (spawn.size() != 1 || memcmp(spawn[0] + 0x15 - 0x257, kDt, sizeof(kDt)) != 0) {
+        LOGF("[fps] volume emitter not found (%zu) - its particles stay per frame", spawn.size());
+        return;
+    }
+    auto* mem = static_cast<uint8_t*>(VirtualAlloc(nullptr, 128, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!mem)
+        return;
+    auto addr = [](const void* p) { return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p)); };
+    uint8_t* const site = spawn[0] + 0x15;
+    Asm a{mem};
+    a.Bytes({0xD8, 0x8E, 0x88, 0x00, 0x00, 0x00});          // fmul [esi+0x88]
+    a.Bytes({0xD9, 0x41, 0x64});                            // fld [ecx+0x64]
+    a.Bytes({0xD8, 0x0D}), a.Dword(addr(&kSixty));          // fmul [60]
+    a.Bytes({0xD9, 0x05}), a.Dword(addr(&kMaxScale));       // fld [3]
+    a.Bytes({0xDB, 0xF1});                                  // fcomi st,st(1)
+    a.Bytes({0xDB, 0xC1});                                  // fcmovnb st,st(1): min(3, dt*60)
+    a.Bytes({0xDD, 0xD9});                                  // fstp st(1)
+    a.Bytes({0xDE, 0xC9});                                  // fmulp
+    a.Bytes({0x50});                                        // push eax
+    a.Bytes({0xA1}), a.Dword(addr(&g_seed));                // lcg step
+    a.Bytes({0x69, 0xC0}), a.Dword(1664525);
+    a.Bytes({0x05}), a.Dword(1013904223);
+    a.Bytes({0xA3}), a.Dword(addr(&g_seed));
+    a.Bytes({0xC1, 0xE8, 0x09, 0x0D}), a.Dword(0x3F800000); // 1 + r in [1, 2)
+    a.Bytes({0xA3}), a.Dword(addr(&g_scratch));
+    a.Bytes({0x58});                                        // pop eax
+    a.Bytes({0xD8, 0x05}), a.Dword(addr(&g_scratch));       // fadd
+    a.Bytes({0xD8, 0x25}), a.Dword(addr(&kOne));            // fsub [1]
+    a.Jmp(site + 6);
+    FlushInstructionCache(GetCurrentProcess(), mem, a.n);
+    JumpTo(site, 6, mem);
+    LOGF("[fps] volume emitters spawn per second, not per frame");
+}
+
 // false while the code is still encrypted; true once patched or found unpatchable
 bool TryPatch()
 {
@@ -326,6 +376,7 @@ bool TryPatch()
     Write(site, jmp, sizeof(jmp));
 
     PatchExhaust(ranges);
+    PatchVolumeEmitter(ranges);
     LOGF("[fps] simulation and frame cap at %d Hz (was 60), up to %d ticks per frame, %d KB "
          "sound command buffer",
          g_rate, cap, cmdBytes / 1024);
